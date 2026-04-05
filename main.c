@@ -1,8 +1,14 @@
+
+// インクルード順番が重要１
+#include <windows.h>
+// インクルード順番が重要２
+#include <commctrl.h>
+
 #include <shlobj.h>
+#include <shlwapi.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
-#include <windows.h>
 #include <winioctl.h>
 
 #define SECTOR_SIZE 512
@@ -14,6 +20,9 @@
 #ifndef IOCTL_DISK_SET_DISK_ATTRIBUTES
 #define IOCTL_DISK_SET_DISK_ATTRIBUTES 0x0007c0f0
 #endif
+
+HWND hCombo, hEdit, hBtn;  // GUIコントロールのハンドル
+int g_SystemDiskIndex = 0; // システムドライブ番号
 
 typedef struct {
     DWORD Version;
@@ -105,6 +114,31 @@ void ListDrives() {
     }
 }
 
+// システムがインストールされている物理ディスク番号を返す
+int GetSystemDiskIndex() {
+    char winDir[MAX_PATH];
+    char volPath[10];
+    GetWindowsDirectoryA(winDir, MAX_PATH);
+
+    // "C:\Windows" -> "\\.\C:"
+    snprintf(volPath, sizeof(volPath), "\\\\.\\%.2s", winDir);
+
+    HANDLE hVol = CreateFileA(volPath, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              NULL, OPEN_EXISTING, 0, NULL);
+    if(hVol == INVALID_HANDLE_VALUE)
+        return 0; // 失敗時は安全のためDisk 0を返す
+
+    STORAGE_DEVICE_NUMBER sdn;
+    DWORD br;
+    int res = 0;
+    if(DeviceIoControl(hVol, IOCTL_STORAGE_GET_DEVICE_NUMBER, NULL, 0, &sdn,
+                       sizeof(sdn), &br, NULL)) {
+        res = sdn.DeviceNumber;
+    }
+    CloseHandle(hVol);
+    return res;
+}
+
 bool SetDiskOffline(HANDLE h, bool offline) {
     SET_DISK_ATTRIBUTES attr = {0};
     attr.Version = sizeof(SET_DISK_ATTRIBUTES);
@@ -128,9 +162,10 @@ bool WriteSectorStrict(HANDLE h, LONGLONG lba, void *data, DWORD size) {
 }
 
 bool DoFormat(int index) {
-    if(index == 0) {
-        printf("\n[CRITICAL ERROR] Access to System Drive (Disk 0) is DENIED "
-               "for safety.\n");
+    if(index == g_SystemDiskIndex) {
+        fprintf(stderr,
+                "[FATAL] Drive %d is the SYSTEM DRIVE. Protection active.\n",
+                index);
         return false;
     }
 
@@ -269,15 +304,161 @@ bool DoFormat(int index) {
     return true;
 }
 
+// ログ出力用関数
+void AppendLog(const char *text) {
+    int len = GetWindowTextLength(hEdit);
+    SendMessageA(hEdit, EM_SETSEL, len, len);
+    SendMessageA(hEdit, EM_REPLACESEL, 0, (LPARAM)text);
+    SendMessageA(hEdit, EM_REPLACESEL, 0, (LPARAM) "\r\n");
+}
+
+// ドライブ一覧をコンボボックスに補充
+void RefreshDriveList() {
+    SendMessage(hCombo, CB_RESETCONTENT, 0, 0);
+    for(int i = 0; i < 16; i++) {
+        char path[64];
+        sprintf(path, "\\\\.\\PhysicalDrive%d", i);
+        HANDLE h = CreateFileA(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               NULL, OPEN_EXISTING, 0, NULL);
+        if(h != INVALID_HANDLE_VALUE) {
+            DISK_GEOMETRY_EX geo;
+            DWORD br;
+            if(DeviceIoControl(h, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, NULL, 0,
+                               &geo, sizeof(geo), &br, NULL)) {
+                char buf[128];
+                double gb =
+                    (double)geo.DiskSize.QuadPart / (1024.0 * 1024.0 * 1024.0);
+                if(i == g_SystemDiskIndex) {
+                    sprintf(buf, "Disk %d (%.2f GB) [SYSTEM - PROTECTED]", i,
+                            gb);
+                } else {
+                    sprintf(buf, "Disk %d (%.2f GB)", i, gb);
+                }
+                SendMessageA(hCombo, CB_ADDSTRING, 0, (LPARAM)buf);
+            }
+            CloseHandle(h);
+        }
+    }
+    SendMessage(hCombo, CB_SETCURSEL, 0, 0);
+}
+
+// ウィンドウプロシージャ
+LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam,
+                            LPARAM lParam) {
+    switch(uMsg) {
+    case WM_CREATE: {
+        // フォント作成
+        HFONT hFont =
+            CreateFontA(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                        ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                        DEFAULT_QUALITY, DEFAULT_PITCH | FF_SWISS, "Meiryo UI");
+
+        HWND hLbl =
+            CreateWindowA("STATIC", "Select Drive:", WS_VISIBLE | WS_CHILD, 10,
+                          15, 100, 20, hwnd, NULL, NULL, NULL);
+        SendMessage(hLbl, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        hCombo = CreateWindowA("COMBOBOX", "",
+                               WS_VISIBLE | WS_CHILD | CBS_DROPDOWNLIST, 110,
+                               10, 200, 200, hwnd, NULL, NULL, NULL);
+        SendMessage(hCombo, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        hBtn = CreateWindowA("BUTTON", "FORMAT", WS_VISIBLE | WS_CHILD, 320, 10,
+                             100, 25, hwnd, (HMENU)101, NULL, NULL);
+        SendMessage(hBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        hEdit = CreateWindowA("EDIT", "",
+                              WS_VISIBLE | WS_CHILD | WS_VSCROLL |
+                                  ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
+                              10, 45, 410, 200, hwnd, NULL, NULL, NULL);
+        SendMessage(hEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        RefreshDriveList();
+        AppendLog("fat32fmt initialized. Ready.");
+        return 0;
+    }
+    case WM_COMMAND: {
+        if(LOWORD(wParam) == 101) { // ボタンクリック
+            int sel = SendMessage(hCombo, CB_GETCURSEL, 0, 0);
+            if(sel == CB_ERR)
+                return 0;
+
+            char buf[128];
+            SendMessageA(hCombo, CB_GETLBTEXT, sel, (LPARAM)buf);
+            int diskIndex = -1;
+            sscanf(buf, "Disk %d", &diskIndex);
+
+            if(diskIndex == 0) {
+                MessageBoxA(hwnd, "Cannot format System Drive!", "Error",
+                            MB_ICONSTOP);
+                return 0;
+            }
+
+            char warn[256];
+            sprintf(warn,
+                    "Are you sure you want to format Disk %d?\nALL DATA WILL "
+                    "BE ERASED!",
+                    diskIndex);
+            if(MessageBoxA(hwnd, warn, "Warning", MB_YESNO | MB_ICONWARNING) ==
+               IDYES) {
+                EnableWindow(hBtn, FALSE);
+                AppendLog("Starting format...");
+                // 実際の処理呼び出し（DoFormatをGUI対応にするなら戻り値やログを考慮）
+                if(DoFormat(diskIndex)) {
+                    AppendLog("Successfully formatted!");
+                    MessageBoxA(hwnd, "Format Complete!", "Success",
+                                MB_ICONINFORMATION);
+                } else {
+                    AppendLog("ERROR: Format failed.");
+                }
+                EnableWindow(hBtn, TRUE);
+            }
+        }
+        return 0;
+    }
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProc(hwnd, uMsg, wParam, lParam);
+}
+
+void StartGui(HINSTANCE hInstance) {
+    InitCommonControls(); // コモンコントロール初期化
+    const char CLASS_NAME[] = "fat32fmt_gui";
+    WNDCLASSA wc = {0};
+    wc.lpfnWndProc = WindowProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = CLASS_NAME;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    RegisterClassA(&wc);
+
+    HWND hwnd = CreateWindowExA(
+        0, CLASS_NAME, "fat32fmt - FAT32 Formatter",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT,
+        CW_USEDEFAULT, 445, 300, NULL, NULL, hInstance, NULL);
+    ShowWindow(hwnd, SW_SHOW);
+    MSG msg;
+    while(GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+}
+
 int main(int argc, char *argv[]) {
     if(IsUserAnAdmin() == 0) {
         printf("[ERROR] This program requires Administrator privileges.\n");
         return 1;
     }
 
+    g_SystemDiskIndex = GetSystemDiskIndex();
+
     if(argc < 2) {
-        ShowHelp();
-        return 0;
+        // 引数なし：コンソールを切り離してGUIを起動
+        FreeConsole();
+        StartGui(GetModuleHandle(NULL));
+        return 0; // StartGuiが終了したらプログラム終了
     }
 
     for(int i = 1; i < argc; i++) {
